@@ -10,46 +10,8 @@ import {
   UploadCloud,
   ChevronLeft
 } from 'lucide-react';
-import { initializeApp } from 'firebase/app';
-import {
-  getAuth,
-  signInWithCustomToken,
-  signInAnonymously,
-  onAuthStateChanged
-} from 'firebase/auth';
-import {
-  getFirestore,
-  collection,
-  doc,
-  setDoc,
-  deleteDoc,
-  updateDoc,
-  onSnapshot,
-  increment,
-  writeBatch
-} from 'firebase/firestore';
+import LiteSQL from './litesql';
 
-const firebaseConfig = (() => {
-  if (typeof __firebase_config !== 'undefined' && __firebase_config) {
-    return JSON.parse(__firebase_config);
-  }
-
-  if (import.meta.env.VITE_FIREBASE_CONFIG) {
-    return JSON.parse(import.meta.env.VITE_FIREBASE_CONFIG);
-  }
-
-  console.warn('Missing firebase config; using placeholder defaults.');
-  return {
-    apiKey: 'demo-api-key',
-    authDomain: 'demo.firebaseapp.com',
-    projectId: 'demo-project',
-    appId: 'demo-app'
-  };
-})();
-
-const app = initializeApp(firebaseConfig);
-const auth = getAuth(app);
-const db = getFirestore(app);
 const appId = typeof __app_id !== 'undefined' ? __app_id : import.meta.env.VITE_APP_ID || 'default-app-id';
 
 const IMPORTED_RECEIPT_DATA = [
@@ -167,11 +129,11 @@ const Scanner = ({ onScan, onClose, lastScannedItem }) => {
 };
 
 export default function App() {
-  const [user, setUser] = useState(null);
   const [activeTab, setActiveTab] = useState('list');
   const [showScanner, setShowScanner] = useState(false);
   const [groceryList, setGroceryList] = useState([]);
   const [catalog, setCatalog] = useState({});
+  const [receipts, setReceipts] = useState([]);
   const [loading, setLoading] = useState(true);
 
   const [listTotal, setListTotal] = useState(0);
@@ -183,54 +145,27 @@ export default function App() {
   const [lastScanned, setLastScanned] = useState(null);
   const [newProductBarcode, setNewProductBarcode] = useState(null);
   const [newProductForm, setNewProductForm] = useState({ name: '', price: '' });
+  const isHydratedRef = useRef(false);
+  const dbRef = useRef(null);
 
   useEffect(() => {
-    const initAuth = async () => {
-      if (typeof __initial_auth_token !== 'undefined' && __initial_auth_token) {
-        await signInWithCustomToken(auth, __initial_auth_token);
-      } else if (import.meta.env.VITE_INITIAL_AUTH_TOKEN) {
-        await signInWithCustomToken(auth, import.meta.env.VITE_INITIAL_AUTH_TOKEN);
-      } else {
-        await signInAnonymously(auth);
-      }
-    };
-    initAuth();
-    const unsubscribe = onAuthStateChanged(auth, setUser);
-    return () => unsubscribe();
+    const db = new LiteSQL(appId);
+    dbRef.current = db;
+
+    db.init().then((state) => {
+      setGroceryList(state.groceryList || []);
+      setCatalog(state.catalog || {});
+      setReceipts(state.receipts || []);
+      setLoading(false);
+      isHydratedRef.current = true;
+    });
   }, []);
 
   useEffect(() => {
-    if (!user) return undefined;
-
-    const listRef = collection(db, 'artifacts', appId, 'users', user.uid, 'grocery_list');
-    const unsubList = onSnapshot(
-      listRef,
-      (snapshot) => {
-        const items = snapshot.docs.map((d) => ({ id: d.id, ...d.data() }));
-        setGroceryList(items);
-        setLoading(false);
-      },
-      (err) => console.error(err)
-    );
-
-    const catalogRef = collection(db, 'artifacts', appId, 'users', user.uid, 'product_catalog');
-    const unsubCatalog = onSnapshot(
-      catalogRef,
-      (snapshot) => {
-        const products = {};
-        snapshot.docs.forEach((d) => {
-          products[d.id] = d.data();
-        });
-        setCatalog(products);
-      },
-      (err) => console.error(err)
-    );
-
-    return () => {
-      unsubList();
-      unsubCatalog();
-    };
-  }, [user]);
+    if (!isHydratedRef.current) return;
+    if (!dbRef.current) return;
+    dbRef.current.persist({ groceryList, catalog, receipts });
+  }, [groceryList, catalog, receipts]);
 
   useEffect(() => {
     let planned = 0;
@@ -264,13 +199,11 @@ export default function App() {
   }, [searchQuery, catalog]);
 
   const handleScan = async (barcode) => {
-    if (!user) return;
-
     const product = catalog[barcode];
 
     if (product) {
       setLastScanned(product);
-      await addToGroceryList(barcode, true);
+      addToGroceryList(barcode, true);
       setTimeout(() => setLastScanned(null), 3000);
     } else {
       setShowScanner(false);
@@ -278,58 +211,123 @@ export default function App() {
     }
   };
 
-  const addToGroceryList = async (barcode, markAsBought = false) => {
-    if (!user) return;
-    const listRef = collection(db, 'artifacts', appId, 'users', user.uid, 'grocery_list');
-    const existing = groceryList.find((i) => i.barcode === barcode);
+  const parseReceiptText = (text) => {
+    if (!text) return [];
 
-    if (existing) {
-      if (markAsBought && !existing.bought) {
-        await updateDoc(doc(listRef, existing.id), { bought: true });
-      } else {
-        await updateDoc(doc(listRef, existing.id), {
-          qty: increment(1),
-          bought: markAsBought ? true : existing.bought
-        });
+    try {
+      const parsed = JSON.parse(text);
+      const items = Array.isArray(parsed) ? parsed : parsed.items;
+      if (Array.isArray(items)) {
+        return items
+          .map((item) => ({
+            barcode: item.barcode || item.id,
+            name: item.name,
+            price: parseFloat(item.price) || 0
+          }))
+          .filter((item) => item.barcode && item.name);
       }
-    } else {
-      await setDoc(doc(listRef, barcode), {
-        barcode,
-        qty: 1,
-        bought: markAsBought,
-        createdAt: Date.now()
+    } catch (err) {
+      // not JSON, continue to CSV/text parsing
+    }
+
+    return text
+      .split(/\r?\n/)
+      .map((line) => line.trim())
+      .filter(Boolean)
+      .map((line) => line.split(',').map((part) => part.trim()))
+      .filter((parts) => parts.length >= 3)
+      .map((parts) => {
+        const [barcode, ...rest] = parts;
+        const price = parseFloat(rest.pop()) || 0;
+        const name = rest.join(', ') || 'Unknown Item';
+        return { barcode, name, price };
       });
+  };
+
+  const parseReceiptFile = async (file) => {
+    try {
+      const text = await file.text();
+      return parseReceiptText(text);
+    } catch (err) {
+      console.error('Failed to parse receipt file', err);
+      return [];
     }
   };
 
-  const toggleBought = async (item) => {
-    if (!user) return;
-    const itemRef = doc(db, 'artifacts', appId, 'users', user.uid, 'grocery_list', item.id);
-    await updateDoc(itemRef, { bought: !item.bought });
+  const addToGroceryList = (barcode, markAsBought = false) => {
+    setGroceryList((prev) => {
+      const existing = prev.find((i) => i.barcode === barcode);
+      if (existing) {
+        return prev.map((item) => {
+          if (item.barcode !== barcode) return item;
+          if (markAsBought && !item.bought) {
+            return { ...item, bought: true };
+          }
+          return {
+            ...item,
+            qty: item.qty + 1,
+            bought: markAsBought ? true : item.bought
+          };
+        });
+      }
+      return [
+        ...prev,
+        { barcode, id: barcode, qty: 1, bought: markAsBought, createdAt: Date.now() }
+      ];
+    });
   };
 
-  const deleteItem = async (id) => {
-    if (!user) return;
-    await deleteDoc(doc(db, 'artifacts', appId, 'users', user.uid, 'grocery_list', id));
+  const mergeReceiptItems = (items) => {
+    setCatalog((prev) => {
+      const next = { ...prev };
+      items.forEach((item) => {
+        if (!item.barcode || !item.name) return;
+        next[item.barcode] = {
+          barcode: item.barcode,
+          name: item.name,
+          price: parseFloat(item.price) || 0
+        };
+      });
+      return next;
+    });
   };
 
-  const clearCart = async () => {
-    if (!user) return;
-    const batch = writeBatch(db);
+  const recordReceipt = (fileName, items, source) => {
+    const total = items.reduce((sum, item) => sum + (parseFloat(item.price) || 0), 0);
+    setReceipts((prev) => [
+      {
+        id: `receipt-${Date.now()}-${Math.random().toString(36).slice(2, 7)}`,
+        fileName,
+        itemCount: items.length,
+        total,
+        importedAt: Date.now(),
+        source
+      },
+      ...prev
+    ]);
+  };
+
+  const toggleBought = (item) => {
+    setGroceryList((prev) =>
+      prev.map((entry) => (entry.id === item.id ? { ...entry, bought: !entry.bought } : entry))
+    );
+  };
+
+  const deleteItem = (id) => {
+    setGroceryList((prev) => prev.filter((item) => item.id !== id));
+  };
+
+  const clearCart = () => {
     const boughtItems = groceryList.filter((i) => i.bought);
 
     if (confirm(`Checkout ${boughtItems.length} items? This will remove them from your list.`)) {
-      boughtItems.forEach((item) => {
-        const ref = doc(db, 'artifacts', appId, 'users', user.uid, 'grocery_list', item.id);
-        batch.delete(ref);
-      });
-      await batch.commit();
+      setGroceryList((prev) => prev.filter((item) => !item.bought));
       setCartTotal(0);
     }
   };
 
-  const saveNewProduct = async () => {
-    if (!user || !newProductBarcode) return;
+  const saveNewProduct = () => {
+    if (!newProductBarcode) return;
     const productData = {
       barcode: newProductBarcode,
       name: newProductForm.name,
@@ -337,11 +335,8 @@ export default function App() {
       createdAt: Date.now()
     };
 
-    await setDoc(
-      doc(db, 'artifacts', appId, 'users', user.uid, 'product_catalog', newProductBarcode),
-      productData
-    );
-    await addToGroceryList(newProductBarcode, true);
+    setCatalog((prev) => ({ ...prev, [newProductBarcode]: productData }));
+    addToGroceryList(newProductBarcode, true);
 
     setNewProductBarcode(null);
     setNewProductForm({ name: '', price: '' });
@@ -351,20 +346,22 @@ export default function App() {
   const handlePDFUpload = async (e) => {
     const file = e.target.files[0];
     if (!file) return;
+
     setLoading(true);
-    setTimeout(async () => {
-      if (!user) return;
-      const batch = writeBatch(db);
-      const catalogRef = collection(db, 'artifacts', appId, 'users', user.uid, 'product_catalog');
-      IMPORTED_RECEIPT_DATA.forEach((item) => {
-        const docRef = doc(catalogRef, item.barcode);
-        batch.set(docRef, { barcode: item.barcode, name: item.name, price: item.price }, { merge: true });
-      });
-      await batch.commit();
-      setLoading(false);
-      alert(`Success! Extracted ${IMPORTED_RECEIPT_DATA.length} items from receipt.`);
-      setActiveTab('list');
-    }, 1500);
+    const parsedItems = await parseReceiptFile(file);
+    const items = parsedItems.length ? parsedItems : IMPORTED_RECEIPT_DATA;
+
+    mergeReceiptItems(items);
+    recordReceipt(file.name, items, parsedItems.length ? 'file' : 'sample');
+
+    setLoading(false);
+    alert(
+      `Success! Imported ${items.length} items from ${
+        parsedItems.length ? 'your file' : 'sample receipt data'
+      }.`
+    );
+    setActiveTab('list');
+    e.target.value = '';
   };
 
   const renderList = () => (
@@ -516,17 +513,47 @@ export default function App() {
   };
 
   const renderUpload = () => (
-    <div className="h-full bg-gray-50 p-6 pt-12 flex flex-col">
+    <div className="h-full bg-gray-50 p-6 pt-12 flex flex-col gap-4">
       <h1 className="text-3xl font-bold text-gray-900 mb-2">Tools</h1>
-      <div className="bg-white p-6 rounded-2xl shadow-sm mb-4">
+      <div className="bg-white p-6 rounded-2xl shadow-sm">
         <h3 className="font-bold flex items-center gap-2 mb-2">
           <UploadCloud size={20} /> Import Receipt
         </h3>
-        <p className="text-xs text-gray-500 mb-4">Upload a PDF invoice to bulk add items and prices to your catalog.</p>
+        <p className="text-xs text-gray-500 mb-4">
+          Upload a PDF, CSV, or JSON invoice to bulk add items and prices to your LiteSQL-backed catalog.
+        </p>
         <label className="block w-full bg-gray-100 hover:bg-gray-200 text-center py-3 rounded-xl cursor-pointer transition-colors font-medium text-gray-700">
-          Choose PDF
-          <input type="file" accept=".pdf" className="hidden" onChange={handlePDFUpload} />
+          Choose File
+          <input type="file" accept=".pdf,.csv,.json,text/plain" className="hidden" onChange={handlePDFUpload} />
         </label>
+        <p className="text-[11px] text-gray-400 mt-3">
+          Expected formats: CSV rows of <strong>barcode,name,price</strong> or JSON array/`items` field with barcode, name, and price values.
+        </p>
+      </div>
+
+      <div className="bg-white p-6 rounded-2xl shadow-sm flex-1 overflow-y-auto">
+        <h3 className="font-bold mb-3">Recent receipt imports</h3>
+        {receipts.length === 0 ? (
+          <p className="text-sm text-gray-500">No receipts imported yet.</p>
+        ) : (
+          <div className="space-y-3">
+            {receipts.map((receipt) => (
+              <div key={receipt.id} className="border border-gray-100 rounded-xl p-4">
+                <div className="flex justify-between items-center mb-1">
+                  <div className="font-semibold text-gray-800">{receipt.fileName}</div>
+                  <div className="text-xs text-gray-400 uppercase">{receipt.source === 'sample' ? 'Sample' : 'Uploaded'}</div>
+                </div>
+                <div className="text-sm text-gray-600 flex justify-between">
+                  <span>{receipt.itemCount} items</span>
+                  <span className="font-mono font-semibold">{receipt.total.toFixed(3)} BHD</span>
+                </div>
+                <div className="text-[11px] text-gray-400 mt-1">
+                  Imported {new Date(receipt.importedAt).toLocaleString()}
+                </div>
+              </div>
+            ))}
+          </div>
+        )}
       </div>
     </div>
   );
